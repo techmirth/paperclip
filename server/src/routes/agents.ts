@@ -550,6 +550,29 @@ export function agentRoutes(
     return adapterType;
   }
 
+  // CUL-252 guardrail: reject `adapterConfig.model` values not in the adapter's
+  // published model list. Manual PATCHes from the UI/API have repeatedly set
+  // model to fictitious strings (e.g. "deepseek-v4-pro" on the claude_local
+  // adapter), which the underlying CLI then rejects on spawn — producing
+  // silent-run hangs / status:error. Adapters that don't publish a model list
+  // (listAdapterModels returns []) are skipped so this stays a no-op for
+  // adapters where "model" is not a meaningful key.
+  async function assertAdapterModelKnown(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown> | null | undefined,
+  ): Promise<void> {
+    if (!adapterType) return;
+    if (!adapterConfig || typeof adapterConfig !== "object") return;
+    const requestedModel = (adapterConfig as Record<string, unknown>).model;
+    if (typeof requestedModel !== "string" || requestedModel.trim().length === 0) return;
+    const models = await listAdapterModels(adapterType);
+    if (models.length === 0) return;
+    if (models.some((m) => m.id === requestedModel)) return;
+    throw unprocessable(
+      `Adapter "${adapterType}" does not support model "${requestedModel}". Allowed models: ${models.map((m) => m.id).join(", ")}`,
+    );
+  }
+
   async function assertAgentDefaultEnvironmentSelection(
     companyId: string,
     environmentId: string | null | undefined,
@@ -773,6 +796,7 @@ export function agentRoutes(
         ? { ...input.constraintAdapterConfig, ...normalizedAdapterConfig }
         : normalizedAdapterConfig,
     );
+    await assertAdapterModelKnown(input.adapterType, normalizedAdapterConfig);
     return normalizedAdapterConfig;
   }
 
