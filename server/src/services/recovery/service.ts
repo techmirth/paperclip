@@ -1176,12 +1176,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       snoozed: 0,
       skipped: 0,
+      reconciled: 0,
       evaluationIssueIds: [] as string[],
     };
 
     for (const run of candidates) {
       if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
         result.snoozed += 1;
+        continue;
+      }
+      // CUL-69 reconciler: when a running row has lost its in-memory handle,
+      // do not fire another stale-active-run evaluation issue on top of the
+      // detached state -- the reaper will terminate the pid (or has already
+      // recorded it for kill on the next reaper cycle). Without this guard,
+      // every recovery cycle creates a fresh CUL-* issue against the same
+      // orphan run for as long as the pid survives. The full kill path
+      // lives in heartbeat.ts reapOrphanedRuns; here we just suppress the
+      // noise once that path has the run in hand.
+      const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+      const hasInMemoryHandle = runningProcesses.has(run.id);
+      const alreadyMarkedDetached = run.errorCode === DETACHED_PROCESS_ERROR_CODE;
+      const pidStillAlive = !hasInMemoryHandle && (() => {
+        const pid = run.processPid;
+        if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+        try { process.kill(pid, 0); return true; }
+        catch (e) { return (e as NodeJS.ErrnoException)?.code === "EPERM" ? true : false; }
+      })();
+      if (!hasInMemoryHandle && (alreadyMarkedDetached || pidStillAlive)) {
+        result.reconciled += 1;
         continue;
       }
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
