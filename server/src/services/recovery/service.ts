@@ -58,6 +58,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { isRecoverySuppressedByRecentUserTransition } from "./user-transition-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -2038,6 +2039,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isRecoverySuppressedByRecentUserTransition(db, issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }
