@@ -6527,7 +6527,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         }
-        continue;
+        // On subsequent passes (errorCode already DETACHED), or even the first
+        // pass when no stale threshold is used, terminate the orphaned process
+        // and fall through to reap the run.
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
       }
 
       let descendantOnlyCleanup = false;
