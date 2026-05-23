@@ -1881,7 +1881,7 @@ export function mergeCoalescedContextSnapshot(
   return merged;
 }
 
-async function buildPaperclipWakePayload(input: {
+export async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
   contextSnapshot: Record<string, unknown>;
@@ -1905,9 +1905,62 @@ async function buildPaperclipWakePayload(input: {
     | null;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const contextCommentIds = extractWakeCommentIds(input.contextSnapshot);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
   const continuationSummary = input.continuationSummary ?? null;
+
+  // Reconciliation: comments that landed between context-snapshot time and
+  // payload-build time are invisible to extractWakeCommentIds. Query the DB
+  // for any comments created after the latest known comment so the agent
+  // doesn't see a stale "pending comments: 0/0" wake.
+  //
+  // PAPERCLIP_WAKE_RECONCILE_COMMENTS=0 disables this (kill switch).
+  const reconcileEnabled =
+    readNonEmptyString(process.env["PAPERCLIP_WAKE_RECONCILE_COMMENTS"]) !== "0";
+  let commentIds = contextCommentIds;
+  if (reconcileEnabled && issueId) {
+    // Compute the latest known comment createdAt by querying the DB for the
+    // most recent comment in the snapshotted set.
+    const latestKnownComment = contextCommentIds.length > 0
+      ? await input.db
+          .select({ createdAt: issueComments.createdAt })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, input.companyId),
+              eq(issueComments.issueId, issueId),
+              inArray(issueComments.id, contextCommentIds),
+            ),
+          )
+          .orderBy(desc(issueComments.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const since = latestKnownComment?.createdAt ?? new Date(0);
+
+    const newCommentIds = await input.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, input.companyId),
+          eq(issueComments.issueId, issueId),
+          gt(issueComments.createdAt, since),
+        ),
+      )
+      .orderBy(asc(issueComments.createdAt))
+      .limit(25);
+    if (newCommentIds.length > 0) {
+      // Merge newly-discovered ids into commentIds, preserving order (snapshotted
+      // ids first, then reconciled ids appended).
+      for (const row of newCommentIds) {
+        if (!commentIds.includes(row.id)) {
+          commentIds.push(row.id);
+        }
+      }
+    }
+  }
+
   const issueSummary =
     input.issueSummary ??
     (issueId
@@ -6099,12 +6152,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issue.status === "done" || issue.status === "cancelled") {
-      if (!resumeIntent && !wakeCommentId) {
+      const isAutomatedWake =
+        wakeReason === "issue_continuation_needed" ||
+        wakeReason === "issue_children_completed" ||
+        retryReason === "issue_continuation_needed";
+      if (isAutomatedWake || (!resumeIntent && !wakeCommentId)) {
         return {
           stale: true,
           errorCode: "issue_terminal_status",
           reason: `Cancelled because issue reached terminal status (${issue.status}) before the queued run could start`,
-          details: { issueId, currentStatus: issue.status },
+          details: { issueId, currentStatus: issue.status, wakeReason, retryReason },
         };
       }
     }
