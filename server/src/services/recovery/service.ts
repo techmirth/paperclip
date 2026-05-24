@@ -429,7 +429,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
-    const [run, deferredWake] = await Promise.all([
+    const [run, deferredWake, pendingWakeInteraction] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -454,9 +454,75 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
+      // CUL-267: a `pending` `wake_assignee` interaction is itself a live
+      // execution path — the assignee will be re-woken when the board (or
+      // agent) resolves it. Without this clause, continuation-recovery loops
+      // and re-fires `issue_continuation_needed` on every cycle while the
+      // assignee is correctly idle waiting for approval / structured input.
+      db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, companyId),
+            eq(issueThreadInteractions.issueId, issueId),
+            eq(issueThreadInteractions.status, "pending"),
+            eq(issueThreadInteractions.continuationPolicy, "wake_assignee"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
     ]);
 
-    return Boolean(run || deferredWake);
+    return Boolean(run || deferredWake || pendingWakeInteraction);
+  }
+
+  // CUL-267: continuation-recovery on a parent issue should respect the work
+  // happening on its open child issues. Without this, an umbrella issue whose
+  // assignee has delegated execution to a child issue (assigned to the same
+  // agent, or to any invokable agent with its own live execution path) gets
+  // re-woken every recovery cycle with `issue_continuation_needed`.
+  async function hasActiveDelegatedExecutionPath(
+    companyId: string,
+    issueId: string,
+    parentAssigneeAgentId: string | null,
+  ) {
+    const children = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, issueId),
+          inArray(issues.status, ["todo", "in_progress"]),
+          isNull(issues.hiddenAt),
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    for (const child of children) {
+      // The parent's own assignee is already executing the work on the child
+      // (`in_progress`). Treat that as a live delegated path so we don't loop
+      // on the parent while the same agent is busy on the child.
+      if (
+        child.status === "in_progress" &&
+        parentAssigneeAgentId &&
+        child.assigneeAgentId === parentAssigneeAgentId
+      ) {
+        return true;
+      }
+      // Otherwise, fall back to "is anyone actually progressing this child?"
+      // Active run, deferred-execution wake, or pending `wake_assignee`
+      // interaction on the child all count.
+      if (await hasActiveExecutionPath(companyId, child.id)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async function hasQueuedIssueWake(companyId: string, issueId: string) {
@@ -2033,7 +2099,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+      if (
+        (await hasActiveExecutionPath(issue.companyId, issue.id)) ||
+        (await hasActiveDelegatedExecutionPath(issue.companyId, issue.id, issue.assigneeAgentId))
+      ) {
         result.skipped += 1;
         continue;
       }
